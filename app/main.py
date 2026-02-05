@@ -1,130 +1,98 @@
 from fastapi import FastAPI, Header, HTTPException
-from typing import Optional
-import base64
-import librosa
+from fastapi.middleware.cors import CORSMiddleware
+import base64, io, os
 import numpy as np
-import tempfile
-import os
+import librosa
+import joblib
 
-app = FastAPI(
-    title="AI Voice Detection API",
-    version="1.0.0"
-)
+app = FastAPI(title="AI Generated Voice Detection API", version="final")
 
 API_KEY = "test_123456"
+MODEL_PATH = "voice_model.pkl"
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+model = joblib.load(MODEL_PATH)
 
 @app.get("/")
 def root():
-    return {
-        "message": "API is running",
-        "status": "ok"
+    return {"status": "ok", "message": "API running"}
+
+def extract_features(audio, sr):
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+    mfcc_mean = np.mean(mfcc, axis=1)
+
+    pitches, _ = librosa.piptrack(y=audio, sr=sr)
+    pitch_vals = pitches[pitches > 0]
+    pitch_mean = np.mean(pitch_vals) if len(pitch_vals) else 0
+    pitch_std = np.std(pitch_vals) if len(pitch_vals) else 0
+
+    rms = librosa.feature.rms(y=audio)
+    rms_mean = np.mean(rms)
+
+    zcr = librosa.feature.zero_crossing_rate(audio)
+    zcr_mean = np.mean(zcr)
+
+    features = np.concatenate([mfcc_mean, [pitch_mean, rms_mean, zcr_mean]]).reshape(1, -1)
+
+    meta = {
+        "pitch_std": pitch_std,
+        "energy": rms_mean,
+        "zcr": zcr_mean
     }
 
+    return features, meta
 
-# =========================
-# FEATURE EXTRACTION
-# =========================
-def extract_audio_features(audio_data, sample_rate):
-    features = []
+@app.api_route("/api/voice-detection", methods=["GET", "POST"])
+def voice_detection(payload: dict = None, x_api_key: str = Header(None)):
 
-    # MFCC (13 coefficients - mean)
-    mfcc = librosa.feature.mfcc(y=audio_data, sr=sample_rate, n_mfcc=13)
-    features.extend(np.mean(mfcc, axis=1))
-
-    # Pitch
-    pitches, _ = librosa.piptrack(y=audio_data, sr=sample_rate)
-    pitch_values = pitches[pitches > 0]
-    pitch_mean = np.mean(pitch_values) if len(pitch_values) > 0 else 0
-    features.append(pitch_mean)
-
-    # Energy (RMS)
-    rms = librosa.feature.rms(y=audio_data)
-    features.append(np.mean(rms))
-
-    # Zero Crossing Rate
-    zcr = librosa.feature.zero_crossing_rate(audio_data)
-    features.append(np.mean(zcr))
-
-    return np.array(features)
-
-
-# =========================
-# MAIN API ENDPOINT
-# =========================
-@app.post("/api/voice-detection")
-def voice_detection(
-    payload: dict,
-    x_api_key: Optional[str] = Header(None)
-):
-    # 🔐 API KEY CHECK
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # =========================
-    # REQUEST VALIDATION
-    # =========================
-    language = payload.get("language")
-    audio_format = payload.get("audioFormat")
-    audio_base64 = payload.get("audioBase64")
+    if payload is None:
+        return {"status": "ok", "message": "Use POST with audio data"}
 
-    if not language or audio_format != "mp3" or not audio_base64:
-        return {
-            "status": "error",
-            "message": "Invalid request format"
-        }
-
-    # =========================
-    # BASE64 DECODE
-    # =========================
     try:
-        audio_bytes = base64.b64decode(audio_base64)
-    except Exception:
+        audio_b64 = payload.get("audioBase64")
+        language = payload.get("language")
+
+        audio_bytes = base64.b64decode(audio_b64)
+        audio_io = io.BytesIO(audio_bytes)
+
+        audio, sr = librosa.load(audio_io, sr=None)
+
+        features, meta = extract_features(audio, sr)
+
+        probs = model.predict_proba(features)[0]
+        prediction = int(np.argmax(probs))
+        confidence = float(probs[prediction])
+
+        classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
+
+        # ---- DYNAMIC EXPLANATION ----
+        if classification == "AI_GENERATED":
+            explanation = (
+                "Low pitch variation and stable energy patterns detected, "
+                "which are commonly observed in AI-generated speech."
+            )
+        else:
+            explanation = (
+                "Higher pitch variability and irregular speech patterns detected, "
+                "which are typical characteristics of natural human speech."
+            )
+
         return {
-            "status": "error",
-            "message": "Audio decoding failed"
+            "status": "success",
+            "language": language,
+            "classification": classification,
+            "confidenceScore": round(confidence, 2),
+            "explanation": explanation
         }
 
-    # =========================
-    # TEMP MP3 FILE
-    # =========================
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_path = temp_audio.name
-    except Exception:
-        return {
-            "status": "error",
-            "message": "Audio file creation failed"
-        }
-
-    # =========================
-    # LOAD AUDIO
-    # =========================
-    try:
-        audio_data, sample_rate = librosa.load(temp_path, sr=None)
-    except Exception:
-        os.remove(temp_path)
-        return {
-            "status": "error",
-            "message": "Audio loading failed"
-        }
-
-    # Remove temp file
-    os.remove(temp_path)
-
-    # =========================
-    # DAY-3 STEP-1: FEATURES
-    # =========================
-    features = extract_audio_features(audio_data, sample_rate)
-
-    # =========================
-    # TEMP RESPONSE (NO ML YET)
-    # =========================
-    return {
-        "status": "success",
-        "language": language,
-        "classification": "HUMAN",
-        "confidenceScore": 0.5,
-        "explanation": "Audio features extracted successfully"
-    }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

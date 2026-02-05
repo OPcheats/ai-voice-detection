@@ -1,130 +1,64 @@
-from fastapi import FastAPI, Header, HTTPException
-from typing import Optional
-import base64
+import os
 import librosa
 import numpy as np
-import tempfile
-import os
+import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
-app = FastAPI(
-    title="AI Voice Detection API",
-    version="1.0.0"
-)
+DATASET_DIR = "dataset"
+AI_DIR = os.path.join(DATASET_DIR, "ai")
+HUMAN_DIR = os.path.join(DATASET_DIR, "human")
 
-API_KEY = "test_123456"
+X = []
+y = []
 
+def extract_features(file_path):
+    y_audio, sr = librosa.load(file_path, sr=None)
 
-@app.get("/")
-def root():
-    return {
-        "message": "API is running",
-        "status": "ok"
-    }
-
-
-# =========================
-# FEATURE EXTRACTION
-# =========================
-def extract_audio_features(audio_data, sample_rate):
-    features = []
-
-    # MFCC (13 coefficients - mean)
-    mfcc = librosa.feature.mfcc(y=audio_data, sr=sample_rate, n_mfcc=13)
-    features.extend(np.mean(mfcc, axis=1))
+    # MFCC (13)
+    mfcc = librosa.feature.mfcc(y=y_audio, sr=sr, n_mfcc=13)
+    mfcc_mean = np.mean(mfcc, axis=1)
 
     # Pitch
-    pitches, _ = librosa.piptrack(y=audio_data, sr=sample_rate)
+    pitches, _ = librosa.piptrack(y=y_audio, sr=sr)
     pitch_values = pitches[pitches > 0]
     pitch_mean = np.mean(pitch_values) if len(pitch_values) > 0 else 0
-    features.append(pitch_mean)
 
-    # Energy (RMS)
-    rms = librosa.feature.rms(y=audio_data)
-    features.append(np.mean(rms))
+    # RMS Energy
+    rms = librosa.feature.rms(y=y_audio)
+    rms_mean = np.mean(rms)
 
-    # Zero Crossing Rate
-    zcr = librosa.feature.zero_crossing_rate(audio_data)
-    features.append(np.mean(zcr))
+    # ZCR
+    zcr = librosa.feature.zero_crossing_rate(y_audio)
+    zcr_mean = np.mean(zcr)
 
-    return np.array(features)
+    return np.concatenate([mfcc_mean, [pitch_mean, rms_mean, zcr_mean]])
 
+# ---- LOAD DATA ----
+for file in os.listdir(AI_DIR):
+    if file.endswith(".mp3") or file.endswith(".wav"):
+        X.append(extract_features(os.path.join(AI_DIR, file)))
+        y.append(1)  # AI
 
-# =========================
-# MAIN API ENDPOINT
-# =========================
-@app.post("/api/voice-detection")
-def voice_detection(
-    payload: dict,
-    x_api_key: Optional[str] = Header(None)
-):
-    # 🔐 API KEY CHECK
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+for file in os.listdir(HUMAN_DIR):
+    if file.endswith(".mp3") or file.endswith(".wav"):
+        X.append(extract_features(os.path.join(HUMAN_DIR, file)))
+        y.append(0)  # Human
 
-    # =========================
-    # REQUEST VALIDATION
-    # =========================
-    language = payload.get("language")
-    audio_format = payload.get("audioFormat")
-    audio_base64 = payload.get("audioBase64")
+X = np.array(X)
+y = np.array(y)
 
-    if not language or audio_format != "mp3" or not audio_base64:
-        return {
-            "status": "error",
-            "message": "Invalid request format"
-        }
+# ---- MODEL PIPELINE ----
+model = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(max_iter=200))
+])
 
-    # =========================
-    # BASE64 DECODE
-    # =========================
-    try:
-        audio_bytes = base64.b64decode(audio_base64)
-    except Exception:
-        return {
-            "status": "error",
-            "message": "Audio decoding failed"
-        }
+model.fit(X, y)
 
-    # =========================
-    # TEMP MP3 FILE
-    # =========================
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_path = temp_audio.name
-    except Exception:
-        return {
-            "status": "error",
-            "message": "Audio file creation failed"
-        }
+joblib.dump(model, "voice_model.pkl")
 
-    # =========================
-    # LOAD AUDIO
-    # =========================
-    try:
-        audio_data, sample_rate = librosa.load(temp_path, sr=None)
-    except Exception:
-        os.remove(temp_path)
-        return {
-            "status": "error",
-            "message": "Audio loading failed"
-        }
-
-    # Remove temp file
-    os.remove(temp_path)
-
-    # =========================
-    # DAY-3 STEP-1: FEATURES
-    # =========================
-    features = extract_audio_features(audio_data, sample_rate)
-
-    # =========================
-    # TEMP RESPONSE (NO ML YET)
-    # =========================
-    return {
-        "status": "success",
-        "language": language,
-        "classification": "HUMAN",
-        "confidenceScore": 0.5,
-        "explanation": "Audio features extracted successfully"
-    }
+print("✅ Model trained and saved as voice_model.pkl")
+print("Features:", X.shape[1])
