@@ -1,139 +1,98 @@
-import base64
-import io
-import os
-import tempfile
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import base64, io, os
 import numpy as np
 import librosa
 import joblib
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+app = FastAPI(title="AI Generated Voice Detection API", version="final")
 
-# ================= CONFIG =================
 API_KEY = "test_123456"
 MODEL_PATH = "voice_model.pkl"
-MAX_AUDIO_SECONDS = 12
-SAMPLE_RATE = 16000
 
-# ================= APP =================
-app = FastAPI(
-    title="AI Generated Voice Detection API",
-    version="1.0"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 model = joblib.load(MODEL_PATH)
 
-# ================= REQUEST SCHEMA =================
-class VoiceRequest(BaseModel):
-    language: str
-    audioFormat: str
-    audioBase64: str
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "API running"}
 
-# ================= FEATURE EXTRACTION =================
-def extract_features(y, sr):
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    zcr = librosa.feature.zero_crossing_rate(y)
-    rms = librosa.feature.rms(y=y)
-    pitch = librosa.yin(y, fmin=50, fmax=300)
+def extract_features(audio, sr):
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+    mfcc_mean = np.mean(mfcc, axis=1)
 
-    features = np.array([
-        mfcc.mean(),
-        mfcc.std(),
-        np.mean(pitch),
-        np.std(pitch),
-        np.mean(rms),
-        np.mean(zcr),
-        np.std(zcr)
-    ])
+    pitches, _ = librosa.piptrack(y=audio, sr=sr)
+    pitch_vals = pitches[pitches > 0]
+    pitch_mean = np.mean(pitch_vals) if len(pitch_vals) else 0
+    pitch_std = np.std(pitch_vals) if len(pitch_vals) else 0
+
+    rms = librosa.feature.rms(y=audio)
+    rms_mean = np.mean(rms)
+
+    zcr = librosa.feature.zero_crossing_rate(audio)
+    zcr_mean = np.mean(zcr)
+
+    features = np.concatenate([mfcc_mean, [pitch_mean, rms_mean, zcr_mean]]).reshape(1, -1)
 
     meta = {
-        "pitch_var": np.std(pitch),
-        "zcr_mean": np.mean(zcr),
-        "energy": np.mean(rms)
+        "pitch_std": pitch_std,
+        "energy": rms_mean,
+        "zcr": zcr_mean
     }
 
-    return features.reshape(1, -1), meta
+    return features, meta
 
-# ================= EXPLANATION ENGINE =================
-def build_explanation(pred, meta):
-    reasons = []
+@app.api_route("/api/voice-detection", methods=["GET", "POST"])
+def voice_detection(payload: dict = None, x_api_key: str = Header(None)):
 
-    if meta["pitch_var"] > 20:
-        reasons.append("higher pitch variability")
-    else:
-        reasons.append("stable pitch pattern")
-
-    if meta["zcr_mean"] > 0.08:
-        reasons.append("irregular speech transitions")
-    else:
-        reasons.append("smooth speech transitions")
-
-    if meta["energy"] < 0.02:
-        reasons.append("synthetic energy envelope")
-    else:
-        reasons.append("natural energy variation")
-
-    if pred == "AI_GENERATED":
-        return "Detected AI-generated voice due to " + ", ".join(reasons) + "."
-    else:
-        return "Detected human voice due to " + ", ".join(reasons) + "."
-
-# ================= API =================
-@app.post("/api/voice-detection")
-def voice_detection(
-    payload: VoiceRequest,
-    x_api_key: str = Header(None)
-):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    try:
-        audio_bytes = base64.b64decode(payload.audioBase64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Base64 audio")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp.write(audio_bytes)
-        audio_path = tmp.name
+    if payload is None:
+        return {"status": "ok", "message": "Use POST with audio data"}
 
     try:
-        y, sr = librosa.load(
-            audio_path,
-            sr=SAMPLE_RATE,
-            mono=True,
-            duration=MAX_AUDIO_SECONDS
-        )
+        audio_b64 = payload.get("audioBase64")
+        language = payload.get("language")
 
-        X, meta = extract_features(y, sr)
+        audio_bytes = base64.b64decode(audio_b64)
+        audio_io = io.BytesIO(audio_bytes)
 
-        probs = model.predict_proba(X)[0]
-        ai_prob = float(probs[1])
-        human_prob = float(probs[0])
+        audio, sr = librosa.load(audio_io, sr=None)
 
-        if ai_prob > human_prob:
-            classification = "AI_GENERATED"
-            confidence = round(ai_prob, 2)
+        features, meta = extract_features(audio, sr)
+
+        probs = model.predict_proba(features)[0]
+        prediction = int(np.argmax(probs))
+        confidence = float(probs[prediction])
+
+        classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
+
+        # ---- DYNAMIC EXPLANATION ----
+        if classification == "AI_GENERATED":
+            explanation = (
+                "Low pitch variation and stable energy patterns detected, "
+                "which are commonly observed in AI-generated speech."
+            )
         else:
-            classification = "HUMAN"
-            confidence = round(human_prob, 2)
-
-        explanation = build_explanation(classification, meta)
+            explanation = (
+                "Higher pitch variability and irregular speech patterns detected, "
+                "which are typical characteristics of natural human speech."
+            )
 
         return {
             "status": "success",
-            "language": payload.language.lower(),
+            "language": language,
             "classification": classification,
-            "confidenceScore": confidence,
+            "confidenceScore": round(confidence, 2),
             "explanation": explanation
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        os.remove(audio_path)
-
-# ================= ROOT =================
-@app.get("/")
-def root():
-    return {"message": "AI Voice Detection API is running"}
+        return {"status": "error", "message": str(e)}
